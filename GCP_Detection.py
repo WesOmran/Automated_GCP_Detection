@@ -1,0 +1,200 @@
+import numpy as np
+import pandas as pd
+import laspy
+from sklearn.cluster import DBSCAN
+import plotly.graph_objects as go
+import plotly.io as pio
+
+# ------------------- DATA LOADING -------------------
+def load_gcp_csv(gcp_csv_path):
+    return pd.read_csv(gcp_csv_path)
+
+def load_las_file(las_file_path):
+    las = laspy.read(las_file_path)
+    points = np.vstack((las.x, las.y, las.z)).T
+    colors = np.vstack((las.red, las.green, las.blue)).T
+    colors_8bit = colors // 256
+    if hasattr(las, 'classification'):
+        classification = las.classification
+        manual_GCP_mask = classification == 8  # Model Key-point class
+        manual_GCP = points[manual_GCP_mask]
+    else:
+        manual_GCP = np.empty((0, 3))
+        print("Warning: LAS file missing classification info.")
+    return points, colors_8bit, manual_GCP
+
+# ------------------- GCP DETECTION -------------------
+def detect_gcps(points, colors_8bit, control_GCP, manual_GCP, buffer, z_threshold, eps, min_samples):
+    detected_coords = []
+    errors = []
+    all_red_points = []
+    all_green_points = []
+    for idx, row in control_GCP.iterrows():
+        print(f"\nProcessing GCP {idx + 1}/{len(control_GCP)} at ({row['Easting']}, {row['Northing']})")
+        x0, y0 = row['Easting'], row['Northing']
+        mask = (
+            (points[:, 0] >= x0 - buffer) & (points[:, 0] <= x0 + buffer) &
+            (points[:, 1] >= y0 - buffer) & (points[:, 1] <= y0 + buffer)
+        )
+        cropped_points = points[mask]
+        cropped_colors = colors_8bit[mask]
+
+        if cropped_points.shape[0] == 0:
+            print(f"GCP {idx}: No points.")
+            detected_coords.append([np.nan, np.nan, np.nan])
+            errors.append(np.nan)
+            continue
+
+        ground_z = np.percentile(cropped_points[:, 2], 10)
+        ground_mask = cropped_points[:, 2] < (ground_z + z_threshold)
+        ground_points = cropped_points[ground_mask]
+        ground_colors = cropped_colors[ground_mask]
+
+        red_mask = (ground_colors[:, 0] > 120) & (ground_colors[:, 1] < 100)
+        green_mask = (ground_colors[:, 1] > 120) & (ground_colors[:, 0] < 100)
+
+        red_points = ground_points[red_mask]
+        green_points = ground_points[green_mask]
+        # Collect all red/green points
+        all_red_points.append(red_points)
+        all_green_points.append(green_points)
+
+        rg_points = np.vstack((red_points, green_points))
+
+        if rg_points.shape[0] == 0:
+            print(f"GCP {idx}: No red/green.")
+            detected_coords.append([np.nan, np.nan, np.nan])
+            errors.append(np.nan)
+            continue
+
+        labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(rg_points[:, :2])
+        valid_labels = np.unique(labels[labels != -1])
+        if len(valid_labels) == 0:
+            print(f"GCP {idx}: No clusters.")
+            detected_coords.append([np.nan, np.nan, np.nan])
+            errors.append(np.nan)
+            continue
+
+        largest_label = max(valid_labels, key=lambda lbl: np.sum(labels == lbl))
+        cluster_points = rg_points[labels == largest_label]
+        centroid = np.mean(cluster_points, axis=0)
+        detected_coords.append(centroid)
+
+        # Error calculation
+        if manual_GCP.shape[0] > 0:
+            dists = np.linalg.norm(manual_GCP - centroid[:3], axis=1)
+            nearest_idx = np.argmin(dists)
+            ref = manual_GCP[nearest_idx]
+            dx = float(centroid[0]) - float(ref[0])
+            dy = float(centroid[1]) - float(ref[1])
+            dz = float(centroid[2]) - float(ref[2])
+            error = np.sqrt(dx**2 + dy**2 + dz**2)
+            errors.append(error)
+            print(f"GCP {idx + 1}: Error = {error:.3f} m")
+        else:
+            errors.append(np.nan)
+            print(f"GCP {idx + 1}: Detected centroid = {centroid}")
+
+    all_red_points = np.vstack([r for r in all_red_points if r.shape[0] > 0]) if all_red_points else np.empty((0,3))
+    all_green_points = np.vstack([g for g in all_green_points if g.shape[0] > 0]) if all_green_points else np.empty((0,3))
+    return detected_coords, errors, all_red_points, all_green_points
+
+# ------------------- SAVE RESULTS -------------------
+def save_detected_gcps(detected_coords, las_file_path):
+    detected_gcp_df = pd.DataFrame({
+        'Detected_Easting': [c[0] for c in detected_coords],
+        'Detected_Northing': [c[1] for c in detected_coords],
+        'Detected_Elevation': [c[2] for c in detected_coords],
+    })
+    detected_export_path = las_file_path.replace(".las", "_DetectedGCPs.csv")
+    detected_gcp_df.to_csv(detected_export_path, index=False)
+    print(f"Detected GCPs exported to: {detected_export_path}")
+
+# ------------------- VISUALIZATION -------------------
+def visualize_detection_interactive(points, red_points, green_points, control_GCP, manual_GCP, detected_coords, max_points):
+    margin = 10  # meters
+    x_min, x_max = control_GCP['Easting'].min() - margin, control_GCP['Easting'].max() + margin
+    y_min, y_max = control_GCP['Northing'].min() - margin, control_GCP['Northing'].max() + margin
+    mask = (
+        (points[:, 0] >= x_min) & (points[:, 0] <= x_max) &
+        (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
+    )
+    cropped_points = points[mask]
+    step = max(1, len(cropped_points) // max_points)
+    subsampled = cropped_points[::step]
+    fig = go.Figure()
+    fig.add_trace(go.Scattergl(
+        x=subsampled[:, 0], y=subsampled[:, 1], mode='markers',
+        marker=dict(size=1, color='lightgray'), hoverinfo='skip', name='LiDAR (subsampled)'
+    ))
+    if red_points.shape[0] > 0:
+        fig.add_trace(go.Scattergl(
+            x=red_points[:, 0], y=red_points[:, 1], mode='markers',
+            marker=dict(size=3, color='red'), name='Filtered Red Points'
+        ))
+    if green_points.shape[0] > 0:
+        fig.add_trace(go.Scattergl(
+            x=green_points[:, 0], y=green_points[:, 1], mode='markers',
+            marker=dict(size=3, color='green'), name='Filtered Green Points'
+        ))
+    fig.add_trace(go.Scattergl(
+        x=control_GCP['Easting'], y=control_GCP['Northing'], mode='markers',
+        marker=dict(size=10, color='blue', symbol='x'), name='GCPs (Ground Truth)'
+    ))
+    detected_coords = np.array(detected_coords)
+    fig.add_trace(go.Scattergl(
+        x=detected_coords[:, 0], y=detected_coords[:, 1], mode='markers',
+        marker=dict(size=10, color='cyan', line=dict(width=1, color='black')), name='Detected GCPs'
+    ))
+    if manual_GCP.shape[0] > 0:
+        fig.add_trace(go.Scattergl(
+            x=manual_GCP[:, 0], y=manual_GCP[:, 1], mode='markers',
+            marker=dict(size=10, color='magenta', line=dict(width=1, color='black')), name='Model Key-points'
+        ))
+    fig.update_layout(
+        title='GCP Detection Visualization (Interactive)',
+        xaxis_title='Easting', yaxis_title='Northing',
+        legend=dict(font=dict(size=10)), width=1000, height=800, template='plotly_white'
+    )
+    print("Launching interactive visualization...")
+    fig.show(renderer="browser") 
+
+# ------------------- MAIN -------------------
+def main(buffer, z_threshold, eps, min_samples, max_points):
+    print("Program started...")
+    # Set your file paths
+    gcp_csv_path = input("Enter Full Path of Control GCP CSV File: ")
+    las_file_path = input("Enter Full Path of LAS File: ")
+    print("Loading data...")
+    
+    control_GCP = load_gcp_csv(gcp_csv_path)
+    print(f"GCP CSV loaded: {gcp_csv_path}, shape: {control_GCP.shape}")
+    
+    points, colors_8bit, manual_GCP = load_las_file(las_file_path)
+    print(f"LAS file loaded: {las_file_path}, points: {points.shape}, manual GCPs: {manual_GCP.shape}")
+    
+    # Align manual GCPs if needed
+    if manual_GCP.shape[0] != 0 and manual_GCP.shape[0] != control_GCP.shape[0]:
+        print("Warning: Manual GCP count doesn't match control GCP count!")
+        manual_GCP = manual_GCP[:control_GCP.shape[0]]
+    print("Detecting GCPs...")
+    detected_coords, errors, red_points, green_points = detect_gcps(
+        points, colors_8bit, control_GCP, manual_GCP, buffer, z_threshold, eps, min_samples
+    )
+    print("\nSaving detected GCPs...")
+    save_detected_gcps(detected_coords, las_file_path)
+    print("Visualizing results...")
+    visualize_detection_interactive(
+        points, red_points, green_points, control_GCP, manual_GCP, detected_coords, max_points
+    )
+    print("Program completed successfully.")
+
+if __name__ == "__main__":
+    # ------------------- PARAMETERS -------------------
+    BUFFER = 4.0        # meters around each GCP
+    Z_THRESHOLD = 0.5   # height threshold to remove vegetation
+    EPS = 0.1           # DBSCAN radius
+    MIN_SAMPLES = 10    # DBSCAN minimum cluster size
+    MAX_POINTS = 1000   # for visualization subsampling
+    
+    main(BUFFER, Z_THRESHOLD, EPS, MIN_SAMPLES, MAX_POINTS)
