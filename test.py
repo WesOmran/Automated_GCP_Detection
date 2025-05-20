@@ -5,6 +5,7 @@ from sklearn.cluster import DBSCAN
 import plotly.graph_objects as go
 import os
 import glob
+import scipy.stats
 
 # ------------------- DATA LOADING -------------------
 def load_gcp_csv(gcp_csv_path):
@@ -159,10 +160,69 @@ def visualize_detection_interactive(points, red_points, green_points, control_GC
         legend=dict(font=dict(size=10)), width=1000, height=800, template='plotly_white'
     )
     print("Launching interactive visualization...")
-    fig.show(renderer="browser") 
+    fig.show(renderer="browser")
     
 # ------------------- STATISTICAL TESTING -------------------
+def test_statistics(control_GCP, detected_GCP, threshold, alpha):
+    """
+    Performs statistical analysis on GCP detection errors:
+    - Computes sample mean and std deviation
+    - Computes confidence interval for the mean using t-distribution
+    - Performs one-sided t-test: H0: mean >= threshold vs Ha: mean < threshold
+    - Flags outliers (>2 std dev from mean)
+    """
+    if control_GCP.shape[0] != detected_GCP.shape[0]:
+        print("Control GCP and Detected GCP counts do not match. Cannot perform statistical testing.")
+        return
 
+    # Step 1: Compute Euclidean errors 
+    errors = np.linalg.norm(control_GCP[['Easting','Northing', 'Elevation']].values - detected_GCP[:, :], axis=1)
+    mean_error = np.mean(errors)
+    std_error = np.std(errors, ddof=1)
+    n = len(errors)
+    df = n - 1
+
+    print(f"\n--- GCP Detection Error Statistics ---")
+    print(f"Mean Error: {mean_error:.4f} m")
+    print(f"Standard Deviation: {std_error:.4f} m")
+
+    # Step 2: Confidence Interval
+    t_crit = scipy.stats.t.ppf(1 - alpha/2, df)
+    ci_half_width = t_crit * (std_error / np.sqrt(n))
+    ci = [mean_error - ci_half_width, mean_error + ci_half_width]
+    print(f"{int((1-alpha)*100)}% Confidence Interval: [{ci[0]:.4f}, {ci[1]:.4f}] m")
+
+    # Step 3: Hypothesis Test (one-sided, mean < threshold)
+    t_stat = (mean_error - threshold) / (std_error / np.sqrt(n))
+    p_value = scipy.stats.t.cdf(t_stat, df)  # one-sided, lower tail
+
+    print(f"\nHypothesis Test: H0: mean >= {threshold:.2f} m, Ha: mean < {threshold:.2f} m")
+    print(f"t statistic: {t_stat:.4f}, p-value: {p_value:.4f}")
+
+    if p_value < alpha:
+        print(f"Result: REJECT H0 (mean error is statistically < {threshold:.2f} m at alpha={alpha})")
+    else:
+        print(f"Result: FAIL TO REJECT H0 (mean error is NOT statistically < {threshold:.2f} m at alpha={alpha})")
+
+    # Step 4: Outlier Detection
+    outlier_indices = np.where(np.abs(errors - mean_error) > 2 * std_error)[0]
+    if len(outlier_indices) > 0:
+        print(f"\nOutlier GCPs (>2 std dev from mean):")
+        for idx in outlier_indices:
+            print(f"  GCP {idx+1}: Error = {errors[idx]:.4f} m")
+    else:
+        print("\nNo outlier GCPs (>2 std dev from mean).")
+
+    # Optionally, return results for further use
+    return {
+        "mean": mean_error,
+        "std": std_error,
+        "ci": ci,
+        "t_stat": t_stat,
+        "p_value": p_value,
+        "outliers": outlier_indices,
+        "errors": errors
+    }
 
 # ------------------- USER INPUT -------------------
 def get_las_files():
@@ -188,7 +248,7 @@ def get_las_files():
     return las_files
 
 # ------------------- MAIN -------------------
-def main(buffer, z_threshold, eps, min_samples, max_points):
+def main(buffer, z_threshold, eps, min_samples, max_points, alpha, threshold):
     print("Program started...")
     las_files = get_las_files()
     for las_file_path in las_files:
@@ -221,10 +281,19 @@ def main(buffer, z_threshold, eps, min_samples, max_points):
 
 if __name__ == "__main__":
     # ------------------- PARAMETERS -------------------
+    # GCP detection parameters
     BUFFER = 3.0        # meters around each GCP
     Z_THRESHOLD = 0.5   # height threshold to remove vegetation
+    
+    # DBSCAN parameters
     EPS = 0.1           # DBSCAN radius
     MIN_SAMPLES = 10    # DBSCAN minimum cluster size
+    
+    # Visualization parameters
     MAX_POINTS = 1000   # for visualization subsampling
     
-    main(BUFFER, Z_THRESHOLD, EPS, MIN_SAMPLES, MAX_POINTS)
+    # Statistical testing parameters
+    ALPHA = 0.05        # significance level
+    THRESHOLD = 0.1     # threshold for hypothesis testing in meters
+    
+    main(BUFFER, Z_THRESHOLD, EPS, MIN_SAMPLES, MAX_POINTS, ALPHA, THRESHOLD)
