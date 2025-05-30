@@ -6,6 +6,25 @@ import plotly.graph_objects as go
 import os
 import glob
 
+"""
+    This Program helps automating the detection of the mid-point in (x, y, z) 
+    of GCP markers. This is specifically made for GCP markers that are as follows: 
+    +-------------+ 
+    |\-----------/|     The GCP that is to be detected is of this shape and color.
+    |-\--green--/-|
+    |--\-------/--|     The program requires a csv file containing the conrol GCP
+    |---\-----/---|     marker positions in (x, y, z) or (Easting, Northing, Elevation)
+    |----\---/----|
+    |-red-\-/-----|     It creates a buffer zone of whatever is specified by the user in m
+    |-----/-\-red-|     around the control GCP marker position. This allows the program to
+    |----/---\----|     search for GCP markers in the LAS file a lot more efficiently.
+    |---/-----\---|     In that buffer zone, the then starts looping through each point
+    |--/-------\--|     to check their RGB values. Using DBScan algorithm, it helps create 
+    |-/--green--\-|     clusters that identifies the GCP markers. 
+    +/-----------\|     From there the program computes the Euclidean mid-point in (x, y, z).
+    
+"""
+
 # ------------------- DATA LOADING -------------------
 def load_gcp_csv(gcp_csv_path):
     return pd.read_csv(gcp_csv_path)
