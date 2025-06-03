@@ -7,18 +7,42 @@ import os
 import glob
 import scipy.stats
 import logging
+import pyproj
 
+# ------------------- GLOBAL VARIABLE -------------------
+logger = logging.getLogger(__name__)
 
 # ------------------- LOGGING -------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("gcp_detection.log", mode='w'),  # log file
-        logging.StreamHandler()  # also print to terminal
-    ]
-)
-logger = logging.getLogger(__name__)
+def logging_setup(log_path):
+    """
+    Sets up logging configuration for the script.
+    Logs will be saved to 'gcp_detection.log' and also printed to the terminal.
+    """
+    if not os.path.exists("gcp_detection.log"):
+        open("gcp_detection.log", 'w').close()  # Create log file if it doesn't exist
+    # Reconfigure logging to use the new log file path
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler("gcp_detection.log", mode='w'),  # log file
+            logging.StreamHandler()  # also print to terminal
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    return logger
 
 # ------------------- DATA LOADING -------------------
 def load_gcp_csv(gcp_csv_path):
@@ -38,13 +62,49 @@ def load_las_file(las_file_path):
         logger.info("LAS file does not contain Key-Point Classified data.")
     return points, colors_8bit, manual_GCP
 
+# ------------------- CRS CHECKING -------------------
+def check_las_crs(las_file_path):
+    try:
+        las = laspy.read(las_file_path)
+        crs = las.header.parse_crs()
+        logger.info(f"LAS CRS for {os.path.basename(las_file_path)}: {crs}")
+        return crs
+    except Exception as e:
+        logger.warning(f"Could not read CRS from LAS file: {e}")
+        return None
+
+def check_csv_crs(gcp_csv_path):
+    # This is a placeholder: CSVs don't store CRS natively.
+    # You must know or document the CRS used for the CSV.
+    # Here, we just log a reminder.
+    logger.info(f"Assuming CSV CRS for {os.path.basename(gcp_csv_path)} is EPSG:5550 (update if different).")
+
 # ------------------- GCP DETECTION -------------------
+# --- Add this transformer at the top-level (after imports) ---
+# Transformer: WGS84 ellipsoid (EPSG:4979) to WGS84+EGM96 geoid (EPSG:4326+5773)
+egm96_transformer = pyproj.Transformer.from_crs(
+    "EPSG:4979", "EPSG:4326+5773", always_xy=True
+)
+
+def correct_z_with_egm96(easting, northing, ellip_height, utm_zone=54, southern_hemisphere=True):
+    """
+    Converts UTM easting/northing and ellipsoidal height to orthometric height using EGM96.
+    """
+    utm_crs = pyproj.CRS.from_proj4(
+        f"+proj=utm +zone={utm_zone} +{'south' if southern_hemisphere else 'north'} +datum=WGS84 +units=m +no_defs"
+    )
+    lon, lat = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True).transform(easting, northing)
+    lon, lat, ortho_height = egm96_transformer.transform(lon, lat, ellip_height)
+    return ortho_height
+
+# --- Modify your detect_gcps function as follows: ---
 def detect_gcps(points, colors_8bit, control_GCP, manual_GCP, buffer, z_threshold, eps, min_samples):
     detected_coords = []
     error_from_manual = []
     error_from_control = []
     all_red_points = []
     all_green_points = []
+    utm_zone = 54  # Papua New Guinea is in UTM zone 54S
     for idx, row in control_GCP.iterrows():
         logger.info(f"\nProcessing {idx + 1}/{control_GCP.shape[0]} GCPs...")
         x0, y0 = row['Easting'], row['Northing']
@@ -95,22 +155,36 @@ def detect_gcps(points, colors_8bit, control_GCP, manual_GCP, buffer, z_threshol
         largest_label = max(valid_labels, key=lambda lbl: np.sum(labels == lbl))
         cluster_points = rg_points[labels == largest_label]
         centroid = np.mean(cluster_points, axis=0)
-        detected_coords.append(centroid)
+
+        # --- Apply EGM96 geoid correction to detected Z ---
+        ortho_z = correct_z_with_egm96(centroid[0], centroid[1], centroid[2], utm_zone=utm_zone, southern_hemisphere=True)
+        detected_coords.append([centroid[0], centroid[1], ortho_z])
+
+        ref_control = np.array([row['Easting'], row['Northing'], row['Elevation']])
+        logger.info(f"{row['Label']}: Control GCP = {ref_control}, Detected centroid = {[centroid[0], centroid[1], ortho_z]}")
+
+        # 3D Euclidean error (now using orthometric Z)
+        if not np.any(np.isnan(centroid)):
+            error_control_3d = np.linalg.norm(np.array([centroid[0], centroid[1], ortho_z]) - ref_control)
+            error_control_2d = np.linalg.norm(np.array([centroid[0], centroid[1]]) - ref_control[:2])
+            error_from_control.append(error_control_3d)
+            logger.info(f"{row['Label']}: 3D Error from Control GCP = {error_control_3d:.3f} m")
+            logger.info(f"{row['Label']}: 2D Error from Control GCP = {error_control_2d:.3f} m")
+            logger.info(f"{row['Label']}: Z (Detected, ortho) = {ortho_z:.3f}, Z (Control) = {ref_control[2]:.3f}, Z diff = {ortho_z - ref_control[2]:.3f} m")
+        else:
+            error_from_control.append(np.nan)
+            logger.info(f"{row['Label']}: No detected centroid, skipping error calculation.")
 
         # Error to manual GCP (if present)
-        if manual_GCP.shape[0] > 0:
-            dists = np.linalg.norm(manual_GCP - centroid[:3], axis=1)
+        if manual_GCP.shape[0] > 0 and not np.any(np.isnan(centroid)):
+            dists = np.linalg.norm(manual_GCP - np.array([centroid[0], centroid[1], ortho_z]), axis=1)
             nearest_idx = np.argmin(dists)
             ref = manual_GCP[nearest_idx]
-            error_manual = np.linalg.norm(centroid[:3] - ref)
+            error_manual = np.linalg.norm(np.array([centroid[0], centroid[1], ortho_z]) - ref)
             error_from_manual.append(error_manual)
             logger.info(f"{row['Label']}: Difference from Manual GCP = {error_manual:.3f} m")
-
-        # Error to control GCP (always)
-        ref_control = np.array([row['Easting'], row['Northing'], row['Elevation']])
-        error_control = np.linalg.norm(centroid[:3] - ref_control)
-        error_from_control.append(error_control)
-        logger.info(f"{row['Label']}: Difference from Control GCP = {error_control:.3f} m")
+        else:
+            error_from_manual.append(np.nan)
 
     detected_coords = np.array(detected_coords)
     error_from_control = np.array(error_from_control)
@@ -264,8 +338,27 @@ def get_las_files():
 
 # ------------------- MAIN -------------------
 def main(buffer, z_threshold, eps, min_samples, max_points, alpha, threshold):
+    # Ask for LAS folder or get from first LAS file
+    las_files = get_las_files()
+    if not las_files:
+        print("No LAS files found. Exiting.")
+        return
+    log_folder = os.path.dirname(las_files[0])
+    log_path = os.path.join(log_folder, "gcp_detection.log")
+
+    logger = logging_setup(log_path)
+
     logger.info("Program started...")
     
+    # Check CRS for first LAS and CSV
+    check_las_crs(las_files[0])
+    # Find corresponding CSV for first LAS file
+    gcp_csv_path = os.path.splitext(las_files[0])[0] + ".csv"
+    if os.path.exists(gcp_csv_path):
+        check_csv_crs(gcp_csv_path)
+    else:
+        logger.warning(f"No CSV found for CRS check: {gcp_csv_path}")
+
     # Load LAS files
     las_files = get_las_files()
     
@@ -320,12 +413,12 @@ def main(buffer, z_threshold, eps, min_samples, max_points, alpha, threshold):
 if __name__ == "__main__":
     # ------------------- PARAMETERS -------------------
     # GCP detection parameters
-    BUFFER = 4.0        # meters around each GCP
+    BUFFER = 3.0        # meters around each GCP
     Z_THRESHOLD = 0.5   # height threshold to remove vegetation
     
     # DBSCAN parameters
     EPS = 0.1           # DBSCAN radius
-    MIN_SAMPLES = 10    # DBSCAN minimum cluster size
+    MIN_SAMPLES = 100    # DBSCAN minimum cluster size
     
     # Visualization parameters
     MAX_POINTS = 1000   # for visualization subsampling
